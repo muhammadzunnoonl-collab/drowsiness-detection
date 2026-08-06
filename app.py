@@ -1,4 +1,3 @@
-%%writefile app.py
 import math
 import time
 import queue
