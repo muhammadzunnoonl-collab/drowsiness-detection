@@ -122,6 +122,11 @@ RTC_CONFIGURATION = RTCConfiguration({
             "username": st.secrets.get("TURN_USERNAME", ""),
             "credential": st.secrets.get("TURN_CREDENTIAL", ""),
         },
+        {
+            "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+            "username": st.secrets.get("TURN_USERNAME", ""),
+            "credential": st.secrets.get("TURN_CREDENTIAL", ""),
+        },
     ]
 })
 ctx = webrtc_streamer(
