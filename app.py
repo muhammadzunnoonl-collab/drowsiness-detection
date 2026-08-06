@@ -113,13 +113,17 @@ RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
         {
-            "urls": ["turn:relay1.expressturn.com:3478"],
+            "urls": ["turn:openrelay.metered.ca:80"],
+            "username": st.secrets.get("TURN_USERNAME", ""),
+            "credential": st.secrets.get("TURN_CREDENTIAL", ""),
+        },
+        {
+            "urls": ["turn:openrelay.metered.ca:443"],
             "username": st.secrets.get("TURN_USERNAME", ""),
             "credential": st.secrets.get("TURN_CREDENTIAL", ""),
         },
     ]
 })
-
 ctx = webrtc_streamer(
     key="drowsiness-realtime",
     video_processor_factory=DrowsinessProcessor,
