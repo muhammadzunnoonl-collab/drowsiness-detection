@@ -12,11 +12,23 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from PIL import ImageFont, ImageDraw, Image
 import av
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
 st.caption("เปิดกล้อง แล้วระบบจะแจ้งเตือนเสียงเมื่อหลับตานานเกินกำหนด")
+
+# ---------- 0. ฟอนต์ไทย (แก้ชื่อไฟล์ตรงนี้ให้ตรงกับที่อัปโหลดขึ้น repo) ----------
+FONT_PATH = "THSarabunNew.ttf"   # <-- แก้ชื่อไฟล์ตรงนี้ให้ตรงกับไฟล์ .ttf ที่อัปโหลดจริง
+thai_font = ImageFont.truetype(FONT_PATH, 32)
+
+def put_thai_text(img_bgr, text, position, color=(255, 255, 255)):
+    """วาดข้อความภาษาไทยลงบนภาพ OpenCV (BGR) โดยใช้ PIL"""
+    img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(img_pil)
+    draw.text(position, text, font=thai_font, fill=(color[2], color[1], color[0]))
+    return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
 # ---------- 1. โหลดโมเดล (ใช้ตัวเดียวกับที่คุณใช้ใน Colab) ----------
 MODEL_PATH = "face_landmarker.task"
@@ -88,6 +100,7 @@ class DrowsinessProcessor(VideoProcessorBase):
             else:
                 self.closed_counter = 0
 
+            # ตัวเลข EAR เป็นภาษาอังกฤษ/ตัวเลข ใช้ cv2.putText ปกติได้ ไม่ต้องแก้
             cv2.putText(img, f"EAR: {avg_ear:.2f}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
@@ -103,8 +116,8 @@ class DrowsinessProcessor(VideoProcessorBase):
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
 
-        cv2.putText(img, status_text, (20, h - 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, status_color, 3)
+        # ข้อความภาษาไทย ต้องใช้ put_thai_text แทน cv2.putText
+        img = put_thai_text(img, status_text, (20, h - 60), status_color)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
