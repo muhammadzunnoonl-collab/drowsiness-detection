@@ -170,6 +170,12 @@ def play_alarm():
 
 alert_placeholder = st.empty()
 
+
+# ปุ่มทดสอบเสียง - ให้ผู้ใช้กดเองก่อน 1 ครั้ง เพื่อปลดล็อกสิทธิ์เล่นเสียงอัตโนมัติของเบราว์เซอร์
+if st.button("🔊 ทดสอบเสียงเตือน (กดก่อนใช้งานครั้งแรก)"):
+    play_alarm()
+    st.success("ถ้าได้ยินเสียงบี๊บ แปลว่าพร้อมใช้งานแล้ว")
+    
 if ctx.state.playing:
     while ctx.state.playing:
         try:
