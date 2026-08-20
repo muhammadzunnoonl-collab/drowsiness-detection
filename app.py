@@ -15,6 +15,7 @@ from streamlit_webrtc import (
     AudioProcessorBase,
     RTCConfiguration,
     WebRtcMode,
+    AudioHTMLAttributes,
 )
 from PIL import ImageFont, ImageDraw, Image
 import av
@@ -177,6 +178,7 @@ ctx = webrtc_streamer(
     audio_processor_factory=AlarmAudioProcessor,
     rtc_configuration=RTC_CONFIGURATION,
     media_stream_constraints={"video": True, "audio": True},
+    audio_html_attrs=AudioHTMLAttributes(autoPlay=True, controls=True, muted=False),
     async_processing=True,
 )
 
