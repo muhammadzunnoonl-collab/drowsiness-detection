@@ -1,5 +1,6 @@
 import math
-import time
+import io
+import wave
 import queue
 import os
 import urllib.request
@@ -7,7 +8,6 @@ import urllib.request
 import cv2
 import numpy as np
 import streamlit as st
-import streamlit.components.v1 as components
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
@@ -30,7 +30,22 @@ def put_thai_text(img_bgr, text, position, color=(255, 255, 255)):
     draw.text(position, text, font=thai_font, fill=(color[2], color[1], color[0]))
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-# ---------- 1. โหลดโมเดล (ใช้ตัวเดียวกับที่คุณใช้ใน Colab) ----------
+# ---------- 0.5 สร้างเสียงบี๊บเตือน (WAV) ----------
+def generate_beep_wav(freq=880, duration=1.0, sample_rate=44100):
+    t = np.linspace(0, duration, int(sample_rate * duration), False)
+    tone = np.sin(freq * t * 2 * np.pi)
+    audio_data = (tone * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(audio_data.tobytes())
+    return buf.getvalue()
+
+BEEP_BYTES = generate_beep_wav()
+
+# ---------- 1. โหลดโมเดล ----------
 MODEL_PATH = "face_landmarker.task"
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
 
@@ -42,7 +57,7 @@ def get_model_path():
 
 model_path = get_model_path()
 
-# ---------- 2. ค่าคงที่ EAR (เหมือนโค้ดเดิมของคุณ) ----------
+# ---------- 2. ค่าคงที่ EAR ----------
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 EAR_THRESHOLD = 0.21
@@ -74,7 +89,7 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.closed_counter = 0
         self.frame_idx = 0
-        self.alert_active = False  # กันไม่ให้ยิงเสียงรัวๆ ทุกเฟรม
+        self.alert_active = False
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -100,7 +115,6 @@ class DrowsinessProcessor(VideoProcessorBase):
             else:
                 self.closed_counter = 0
 
-            # ตัวเลข EAR เป็นภาษาอังกฤษ/ตัวเลข ใช้ cv2.putText ปกติได้ ไม่ต้องแก้
             cv2.putText(img, f"EAR: {avg_ear:.2f}", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
@@ -110,18 +124,17 @@ class DrowsinessProcessor(VideoProcessorBase):
                 cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
                 if not self.alert_active:
                     self.alert_active = True
-                    alert_queue.put("DROWSY")   # ส่งสัญญาณครั้งเดียวตอนเริ่มง่วง
+                    alert_queue.put("DROWSY")
             else:
                 self.alert_active = False
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
 
-        # ข้อความภาษาไทย ต้องใช้ put_thai_text แทน cv2.putText
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---------- 4. TURN server (จำเป็นสำหรับ deploy จริงบน Streamlit Cloud) ----------
+# ---------- 4. TURN server ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
@@ -142,6 +155,7 @@ RTC_CONFIGURATION = RTCConfiguration({
         },
     ]
 })
+
 ctx = webrtc_streamer(
     key="drowsiness-realtime",
     video_processor_factory=DrowsinessProcessor,
@@ -150,38 +164,20 @@ ctx = webrtc_streamer(
     async_processing=True,
 )
 
-# ---------- 5. เล่นเสียงเตือนจาก main thread (แทน display(Javascript) แบบ Colab) ----------
-def play_alarm():
-    components.html(
-        f"""
-        <script>
-        var context = new (window.AudioContext || window.webkitAudioContext)();
-        var osc = context.createOscillator();
-        osc.type = 'sine';
-        osc.frequency.setValueAtTime(880, context.currentTime);
-        osc.connect(context.destination);
-        osc.start();
-        osc.stop(context.currentTime + 1.5);
-        </script>
-        <!-- {time.time()} เพิ่ม timestamp กันเบราว์เซอร์แคชสคริปต์ ทำให้เล่นซ้ำได้ทุกครั้ง -->
-        """,
-        height=0,
-    )
-
+# ---------- 5. แจ้งเตือน + เล่นเสียง ----------
 alert_placeholder = st.empty()
+audio_placeholder = st.empty()
 
-
-# ปุ่มทดสอบเสียง - ให้ผู้ใช้กดเองก่อน 1 ครั้ง เพื่อปลดล็อกสิทธิ์เล่นเสียงอัตโนมัติของเบราว์เซอร์
 if st.button("🔊 ทดสอบเสียงเตือน (กดก่อนใช้งานครั้งแรก)"):
-    play_alarm()
+    audio_placeholder.audio(BEEP_BYTES, format="audio/wav", autoplay=True)
     st.success("ถ้าได้ยินเสียงบี๊บ แปลว่าพร้อมใช้งานแล้ว")
-    
+
 if ctx.state.playing:
     while ctx.state.playing:
         try:
             msg = alert_queue.get(timeout=1.0)
             if msg == "DROWSY":
                 alert_placeholder.error("🚨 ตรวจพบอาการหลับใน! กำลังส่งเสียงเตือน")
-                play_alarm()
+                audio_placeholder.audio(BEEP_BYTES, format="audio/wav", autoplay=True)
         except queue.Empty:
             pass
