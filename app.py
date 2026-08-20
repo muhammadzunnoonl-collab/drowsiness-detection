@@ -1,7 +1,5 @@
 import math
-import io
-import wave
-import queue
+import threading
 import os
 import urllib.request
 
@@ -11,39 +9,30 @@ import streamlit as st
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+from streamlit_webrtc import (
+    webrtc_streamer,
+    VideoProcessorBase,
+    AudioProcessorBase,
+    RTCConfiguration,
+    WebRtcMode,
+)
 from PIL import ImageFont, ImageDraw, Image
 import av
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
-st.caption("เปิดกล้อง แล้วระบบจะแจ้งเตือนเสียงเมื่อหลับตานานเกินกำหนด")
+st.caption("เปิดกล้อง+ไมค์ แล้วระบบจะส่งเสียงไซเรนอัตโนมัติทันทีที่หลับตานานเกินกำหนด")
+st.info("⚠️ เบราว์เซอร์จะขอสิทธิ์กล้องและไมโครโฟน กรุณากด Allow ทั้งสองอย่าง (ระบบไม่บันทึกเสียงจากไมค์ไปที่ไหน ใช้แค่ส่งเสียงไซเรนกลับเท่านั้น)")
 
-# ---------- 0. ฟอนต์ไทย (แก้ชื่อไฟล์ตรงนี้ให้ตรงกับที่อัปโหลดขึ้น repo) ----------
-FONT_PATH = "THSarabunNew.ttf"   # <-- แก้ชื่อไฟล์ตรงนี้ให้ตรงกับไฟล์ .ttf ที่อัปโหลดจริง
+# ---------- 0. ฟอนต์ไทย ----------
+FONT_PATH = "THSarabunNew.ttf"   # แก้ให้ตรงกับชื่อไฟล์ .ttf ที่อัปโหลดจริง
 thai_font = ImageFont.truetype(FONT_PATH, 32)
 
 def put_thai_text(img_bgr, text, position, color=(255, 255, 255)):
-    """วาดข้อความภาษาไทยลงบนภาพ OpenCV (BGR) โดยใช้ PIL"""
     img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
     draw.text(position, text, font=thai_font, fill=(color[2], color[1], color[0]))
     return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-
-# ---------- 0.5 สร้างเสียงบี๊บเตือน (WAV) ----------
-def generate_beep_wav(freq=880, duration=1.0, sample_rate=44100):
-    t = np.linspace(0, duration, int(sample_rate * duration), False)
-    tone = np.sin(freq * t * 2 * np.pi)
-    audio_data = (tone * 32767).astype(np.int16)
-    buf = io.BytesIO()
-    with wave.open(buf, "w") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(audio_data.tobytes())
-    return buf.getvalue()
-
-BEEP_BYTES = generate_beep_wav()
 
 # ---------- 1. โหลดโมเดล ----------
 MODEL_PATH = "face_landmarker.task"
@@ -73,8 +62,8 @@ def calculate_ear(landmarks, eye_indices):
     h = euclidean_dist(p1, p4)
     return (v1 + v2) / (2.0 * h) if h != 0 else 0.0
 
-# ---------- 3. ตัวส่งสัญญาณจาก thread ประมวลผลวิดีโอ มาที่ main thread ----------
-alert_queue = queue.Queue()
+# ---------- 3. สถานะแจ้งเตือนที่ใช้ร่วมกันระหว่างวิดีโอ/เสียง ----------
+drowsy_event = threading.Event()   # set() = กำลังง่วง, clear() = ปกติ
 
 class DrowsinessProcessor(VideoProcessorBase):
     def __init__(self):
@@ -89,7 +78,6 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.closed_counter = 0
         self.frame_idx = 0
-        self.alert_active = False
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -122,19 +110,45 @@ class DrowsinessProcessor(VideoProcessorBase):
                 status_text = "!!! ง่วงนอน โปรดหยุดพัก !!!"
                 status_color = (0, 0, 255)
                 cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
-                if not self.alert_active:
-                    self.alert_active = True
-                    alert_queue.put("DROWSY")
+                drowsy_event.set()      # <-- สั่งให้แทร็กเสียงเริ่มดัง
             else:
-                self.alert_active = False
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
+                drowsy_event.clear()    # <-- สั่งให้เงียบ
+        else:
+            drowsy_event.clear()
 
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
-
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---------- 4. TURN server ----------
+
+# ---------- 4. ตัวสร้างเสียงไซเรน ส่งผ่านแทร็กเสียงของ WebRTC โดยตรง ----------
+class AlarmAudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.phase_samples = 0
+
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        samples = frame.to_ndarray()
+        n = samples.shape[-1]
+        sr = frame.sample_rate
+
+        if drowsy_event.is_set():
+            freq = 1000.0
+            t = (np.arange(n) + self.phase_samples) / sr
+            tone = (0.5 * np.sin(2 * np.pi * freq * t) * 32767).astype(np.int16)
+            self.phase_samples += n
+            out = np.tile(tone, (samples.shape[0], 1)) if samples.ndim == 2 else tone
+        else:
+            self.phase_samples = 0
+            out = np.zeros_like(samples)
+
+        new_frame = av.AudioFrame.from_ndarray(out, layout=frame.layout.name)
+        new_frame.sample_rate = sr
+        new_frame.pts = frame.pts
+        return new_frame
+
+
+# ---------- 5. TURN server ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
@@ -158,26 +172,13 @@ RTC_CONFIGURATION = RTCConfiguration({
 
 ctx = webrtc_streamer(
     key="drowsiness-realtime",
+    mode=WebRtcMode.SENDRECV,
     video_processor_factory=DrowsinessProcessor,
+    audio_processor_factory=AlarmAudioProcessor,
     rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": False},
+    media_stream_constraints={"video": True, "audio": True},
     async_processing=True,
 )
 
-# ---------- 5. แจ้งเตือน + เล่นเสียง ----------
-alert_placeholder = st.empty()
-audio_placeholder = st.empty()
-
-if st.button("🔊 ทดสอบเสียงเตือน (กดก่อนใช้งานครั้งแรก)"):
-    audio_placeholder.audio(BEEP_BYTES, format="audio/wav", autoplay=True)
-    st.success("ถ้าได้ยินเสียงบี๊บ แปลว่าพร้อมใช้งานแล้ว")
-
 if ctx.state.playing:
-    while ctx.state.playing:
-        try:
-            msg = alert_queue.get(timeout=1.0)
-            if msg == "DROWSY":
-                alert_placeholder.error("🚨 ตรวจพบอาการหลับใน! กำลังส่งเสียงเตือน")
-                audio_placeholder.audio(BEEP_BYTES, format="audio/wav", autoplay=True)
-        except queue.Empty:
-            pass
+    st.success("✅ ระบบกำลังทำงาน — เสียงไซเรนจะดังอัตโนมัติทันทีที่ตรวจพบหลับตา ไม่ต้องกดอะไรเพิ่ม")
