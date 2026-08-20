@@ -129,7 +129,7 @@ class AlarmAudioProcessor(AudioProcessorBase):
     def __init__(self):
         self.phase_samples = 0
 
-    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+    def _make_tone_frame(self, frame: av.AudioFrame) -> av.AudioFrame:
         samples = frame.to_ndarray()
         n = samples.shape[-1]
         sr = frame.sample_rate
@@ -149,7 +149,8 @@ class AlarmAudioProcessor(AudioProcessorBase):
         new_frame.pts = frame.pts
         return new_frame
 
-
+    async def recv_queued(self, frames: list[av.AudioFrame]) -> list[av.AudioFrame]:
+        return [self._make_tone_frame(f) for f in frames]
 # ---------- 5. TURN server ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
