@@ -10,12 +10,12 @@ from mediapipe.tasks.python import vision
 from streamlit_webrtc import (
     webrtc_streamer,
     VideoProcessorBase,
-    AudioProcessorBase,
     RTCConfiguration,
     WebRtcMode,
 )
 from PIL import ImageFont, ImageDraw, Image
 import av
+from streamlit_js_eval import streamlit_js_eval
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
@@ -55,9 +55,6 @@ RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 EAR_THRESHOLD = 0.21
 CONSEC_FRAMES = 10
 
-# ตัวแปร Global สำหรับแชร์สถานะระหว่าง Video และ Audio Thread
-is_drowsy_global = False
-
 def euclidean_dist(pt1, pt2):
     return math.hypot(pt1.x - pt2.x, pt1.y - pt2.y)
 
@@ -82,9 +79,9 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.closed_counter = 0
         self.frame_idx = 0
+        self.is_drowsy = False
 
     def recv(self, frame):
-        global is_drowsy_global
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -115,61 +112,58 @@ class DrowsinessProcessor(VideoProcessorBase):
                 status_text = "!!! ง่วงนอน โปรดหยุดพัก !!!"
                 status_color = (0, 0, 255)
                 cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 15)
-                is_drowsy_global = True
+                self.is_drowsy = True
             else:
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
-                is_drowsy_global = False
+                self.is_drowsy = False
         else:
-            is_drowsy_global = False
+            self.is_drowsy = False
 
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---------- 4. Audio Processor (ส่งเสียงผ่าน WebRTC ทันทีที่หลับตา) ----------
-class SirenAudioProcessor(AudioProcessorBase):
-    def __init__(self):
-        self.sample_idx = 0
-
-    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
-        global is_drowsy_global
-        pts = frame.pts
-        sample_rate = frame.sample_rate
-        num_samples = frame.samples
-        
-        # สร้าง Array สัญญาณเสียง PCM
-        if is_drowsy_global:
-            t = (np.arange(num_samples) + self.sample_idx) / sample_rate
-            self.sample_idx += num_samples
-            
-            # คลื่นเสียงความถี่ไซเรน 800Hz สลับ 400Hz
-            freq = 800.0 if (int(t[0] * 4) % 2 == 0) else 400.0
-            sine_wave = (0.3 * np.sin(2 * np.pi * freq * t) * 32767).astype(np.int16)
-            
-            # ปรับเป็น 2 Channels (Stereo)
-            audio_data = np.column_stack((sine_wave, sine_wave)).T
-        else:
-            self.sample_idx = 0
-            audio_data = np.zeros((2, num_samples), dtype=np.int16)
-
-        new_frame = av.AudioFrame.from_ndarray(audio_data, format="s16", layout="stereo")
-        new_frame.sample_rate = sample_rate
-        new_frame.pts = pts
-        return new_frame
-
-# ---------- 5. WebRTC ----------
+# ---------- 4. WebRTC ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
 })
 
-webrtc_streamer(
+ctx = webrtc_streamer(
     key="drowsiness-realtime",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=DrowsinessProcessor,
-    audio_processor_factory=SirenAudioProcessor,
     rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": True},
+    media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
 )
 
-st.warning("📌 ข้อแนะนำ: เมื่อเปิดกล้อง ให้แน่ใจว่าเบราว์เซอร์ไม่ได้ตั้งค่า Mute เสียงของแท็บเว็บนี้อยู่")
+# ---------- 5. สคริปต์สร้างเสียงด้วย Web Audio API ฝั่ง Client ----------
+JS_PLAY_SIREN = """
+(function() {
+    if (!window.audioCtx) {
+        window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (window.audioCtx.state === 'suspended') {
+        window.audioCtx.resume();
+    }
+    let osc = window.audioCtx.createOscillator();
+    let gain = window.audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(800, window.audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(400, window.audioCtx.currentTime + 0.3);
+    
+    gain.gain.setValueAtTime(0.3, window.audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, window.audioCtx.currentTime + 0.3);
+    
+    osc.connect(gain);
+    gain.connect(window.audioCtx.destination);
+    
+    osc.start();
+    osc.stop(window.audioCtx.currentTime + 0.3);
+    return true;
+})()
+"""
+
+# เช็คสถานะจาก Video Processor เพื่อสั่งเล่นเสียงข้ามไปยัง Client
+if ctx.video_processor and ctx.video_processor.is_drowsy:
+    streamlit_js_eval(js_expressions=JS_PLAY_SIREN, key=f"siren_{time.time()}")
