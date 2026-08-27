@@ -1,6 +1,6 @@
 import math
-import threading
 import os
+import time
 import urllib.request
 
 import cv2
@@ -20,6 +20,7 @@ from streamlit_webrtc import (
 )
 from PIL import ImageFont, ImageDraw, Image
 import av
+import threading
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
@@ -31,6 +32,7 @@ FONT_PATH = "THSarabunNew.ttf"   # แก้ให้ตรงกับชื่
 thai_font = ImageFont.truetype(FONT_PATH, 32)
 
 def put_thai_text(img_bgr, text, position, color=(255, 255, 255)):
+    """วาดข้อความภาษาไทยลงบนภาพ OpenCV (BGR) โดยใช้ PIL"""
     img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
     draw.text(position, text, font=thai_font, fill=(color[2], color[1], color[0]))
@@ -149,8 +151,10 @@ class AlarmAudioProcessor(AudioProcessorBase):
         new_frame.pts = frame.pts
         return new_frame
 
-    async def recv_queued(self, frames: list[av.AudioFrame]) -> list[av.AudioFrame]:
+    async def recv_queued(self, frames):
         return [self._make_tone_frame(f) for f in frames]
+
+
 # ---------- 5. TURN server ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
@@ -184,5 +188,13 @@ ctx = webrtc_streamer(
     audio_html_attrs=AudioHTMLAttributes(autoPlay=True, controls=True, muted=False),
     async_processing=True,
 )
+
 if ctx.state.playing:
     st.success("✅ ระบบกำลังทำงาน — เสียงไซเรนจะดังอัตโนมัติทันทีที่ตรวจพบหลับตา ไม่ต้องกดอะไรเพิ่ม")
+
+# ---------- 6. ปุ่มทดสอบบังคับเสียงไซเรน (ไม่ต้องหลับตา) ----------
+if st.button("🧪 ทดสอบบังคับเสียงไซเรน 3 วินาที (ไม่ต้องหลับตา)"):
+    drowsy_event.set()
+    time.sleep(3)
+    drowsy_event.clear()
+    st.success("ปล่อยสัญญาณเสียงไปแล้ว ถ้าไม่ได้ยิน แปลว่าปัญหาอยู่ที่ท่อเสียง WebRTC")
