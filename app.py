@@ -2,6 +2,7 @@ import math
 import os
 import time
 import urllib.request
+import threading
 
 import cv2
 import numpy as np
@@ -20,7 +21,6 @@ from streamlit_webrtc import (
 )
 from PIL import ImageFont, ImageDraw, Image
 import av
-import threading
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
@@ -132,21 +132,25 @@ class AlarmAudioProcessor(AudioProcessorBase):
         self.phase_samples = 0
 
     def _make_tone_frame(self, frame: av.AudioFrame) -> av.AudioFrame:
-        samples = frame.to_ndarray()
-        n = samples.shape[-1]
         sr = frame.sample_rate
+        n = frame.samples  # จำนวนตัวอย่างเสียงต่อช่อง (per-channel)
+        samples = frame.to_ndarray()
 
         if drowsy_event.is_set():
-            freq = 1000.0
             t = (np.arange(n) + self.phase_samples) / sr
-            tone = (0.5 * np.sin(2 * np.pi * freq * t) * 32767).astype(np.int16)
+            tone_mono = (0.5 * np.sin(2 * np.pi * 1000.0 * t) * 32767).astype(np.int16)
             self.phase_samples += n
-            out = np.tile(tone, (samples.shape[0], 1)) if samples.ndim == 2 else tone
+            repeats = samples.size // n if n else 1
+            out = np.tile(tone_mono, repeats).reshape(samples.shape).astype(samples.dtype)
         else:
             self.phase_samples = 0
-            out = np.zeros_like(samples)
+            out = np.zeros(samples.shape, dtype=samples.dtype)
 
-        new_frame = av.AudioFrame.from_ndarray(out, layout=frame.layout.name)
+        new_frame = av.AudioFrame.from_ndarray(
+            out,
+            format=frame.format.name,   # ระบุ format ให้ตรงกับต้นฉบับ
+            layout=frame.layout.name,
+        )
         new_frame.sample_rate = sr
         new_frame.pts = frame.pts
         return new_frame
