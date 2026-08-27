@@ -1,6 +1,5 @@
 import math
 import os
-import time
 import urllib.request
 import cv2
 import numpy as np
@@ -79,7 +78,6 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.closed_counter = 0
         self.frame_idx = 0
-        self.is_drowsy = False
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -111,32 +109,19 @@ class DrowsinessProcessor(VideoProcessorBase):
             if self.closed_counter >= CONSEC_FRAMES:
                 status_text = "!!! ง่วงนอน โปรดหยุดพัก !!!"
                 status_color = (0, 0, 255)
-                cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
-                self.is_drowsy = True
+                # วาดแถบสีแดงหนาไว้รอบๆ เพื่อให้ JS ฝั่งเบราว์เซอร์ใช้จับสัญญาณเสียง
+                cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 20)
             else:
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
-                self.is_drowsy = False
-        else:
-            self.is_drowsy = False
 
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---------- 4. TURN Server & WebRTC ----------
+# ---------- 4. WebRTC ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
-        {
-            "urls": ["turn:openrelay.metered.ca:80"],
-            "username": st.secrets.get("TURN_USERNAME", ""),
-            "credential": st.secrets.get("TURN_CREDENTIAL", ""),
-        },
-        {
-            "urls": ["turn:openrelay.metered.ca:443"],
-            "username": st.secrets.get("TURN_USERNAME", ""),
-            "credential": st.secrets.get("TURN_CREDENTIAL", ""),
-        },
     ]
 })
 
@@ -145,48 +130,63 @@ ctx = webrtc_streamer(
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=DrowsinessProcessor,
     rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": False}, # ไม่ต้องขอสิทธิ์ไมค์ให้ยุ่งยาก
+    media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
 )
 
-# ---------- 5. ระบบส่งเสียงเตือนผ่าน HTML5 Web Audio API ----------
-# สคริปต์ส่งเสียงไซเรนความถี่สูงเตือนผู้ใช้ผ่านเบราว์เซอร์
-sound_script = """
+# ---------- 5. JavaScript ดักจับขอบสีแดงแล้วเล่นเสียงไซเรนทันที ----------
+js_alarm = """
 <script>
-if (!window.audioCtx) {
-    window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-}
-function playSiren() {
-    if (window.audioCtx.state === 'suspended') {
-        window.audioCtx.resume();
+let audioCtx = null;
+let lastPlay = 0;
+
+function playSound() {
+    if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     }
-    var osc = window.audioCtx.createOscillator();
-    var gain = window.audioCtx.createGain();
-    
+    if (audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+    let now = Date.now();
+    if (now - lastPlay < 400) return; // เว้นระยะไม่ให้เสียงซ้อนกันจนแตก
+    lastPlay = now;
+
+    let osc = audioCtx.createOscillator();
+    let gain = audioCtx.createGain();
     osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(800, window.audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(400, window.audioCtx.currentTime + 0.3);
+    osc.frequency.setValueAtTime(900, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(300, audioCtx.currentTime + 0.3);
     
-    gain.gain.setValueAtTime(0.3, window.audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, window.audioCtx.currentTime + 0.3);
+    gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
     
     osc.connect(gain);
-    gain.connect(window.audioCtx.destination);
+    gain.connect(audioCtx.destination);
     
     osc.start();
-    osc.stop(window.audioCtx.currentTime + 0.3);
+    osc.stop(audioCtx.currentTime + 0.3);
 }
-playSiren();
+
+// ตรวจสอบพิกเซลสีแดงของวิดีโอบนหน้าจอทุกๆ 100ms
+setInterval(() => {
+    let videos = parent.document.querySelectorAll("video");
+    if (videos.length === 0) return;
+    let video = videos[0];
+    if (video.paused || video.ended) return;
+
+    let canvas = document.createElement("canvas");
+    canvas.width = 50;
+    canvas.height = 50;
+    let ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, 50, 50);
+    
+    // สุ่มเช็คจุดสีขอบวิดีโอ (ถ้าวิดีโอขึ้นขอบสีแดงเตือนหลับใน)
+    let pixel = ctx.getImageData(5, 5, 1, 1).data;
+    if (pixel[0] > 180 && pixel[1] < 50 && pixel[2] < 50) {
+        playSound();
+    }
+}, 100);
 </script>
 """
 
-# วนลูปเช็คสถานะการง่วงจาก VideoProcessor เพื่อยิงเสียงผ่านหน้าเว็บ
-if ctx.video_processor:
-    if ctx.video_processor.is_drowsy:
-        st.components.v1.html(sound_script, height=0)
-        st.error("🚨 ตรวจพบอาการหลับใน! กำลังส่งเสียงเตือน...")
-
-# ---------- 6. ปุ่มทดสอบเสียงไซเรน ----------
-if st.button("🧪 ทดสอบบังคับเสียงไซเรน 1 ครั้ง"):
-    st.components.v1.html(sound_script, height=0)
-    st.success("ส่งสัญญาณเสียงไซเรนเรียบร้อย!")
+st.components.v1.html(js_alarm, height=0)
