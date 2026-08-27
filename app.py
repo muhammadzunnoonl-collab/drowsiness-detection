@@ -10,6 +10,7 @@ from mediapipe.tasks.python import vision
 from streamlit_webrtc import (
     webrtc_streamer,
     VideoProcessorBase,
+    AudioProcessorBase,
     RTCConfiguration,
     WebRtcMode,
 )
@@ -18,7 +19,7 @@ import av
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
-st.caption("เปิดกล้อง แล้วกดปุ่มปลดล็อกเสียงไซเรนด้านล่างก่อนใช้งาน")
+st.caption("เปิดกล้องแล้วระบบจะส่งเสียงไซเรนเตือนทันทีที่ตรวจพบการหลับใน")
 
 # ---------- 0. ฟอนต์ไทย ----------
 FONT_PATH = "THSarabunNew.ttf"
@@ -54,6 +55,9 @@ RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 EAR_THRESHOLD = 0.21
 CONSEC_FRAMES = 10
 
+# ตัวแปร Global สำหรับแชร์สถานะระหว่าง Video และ Audio Thread
+is_drowsy_global = False
+
 def euclidean_dist(pt1, pt2):
     return math.hypot(pt1.x - pt2.x, pt1.y - pt2.y)
 
@@ -80,6 +84,7 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.frame_idx = 0
 
     def recv(self, frame):
+        global is_drowsy_global
         img = frame.to_ndarray(format="bgr24")
         h, w = img.shape[:2]
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -109,16 +114,50 @@ class DrowsinessProcessor(VideoProcessorBase):
             if self.closed_counter >= CONSEC_FRAMES:
                 status_text = "!!! ง่วงนอน โปรดหยุดพัก !!!"
                 status_color = (0, 0, 255)
-                # วาดกรอบสีแดงหนาเพื่อส่งสัญญาณให้เบราว์เซอร์
-                cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 30)
+                cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 15)
+                is_drowsy_global = True
             else:
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
+                is_drowsy_global = False
+        else:
+            is_drowsy_global = False
 
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-# ---------- 4. WebRTC ----------
+# ---------- 4. Audio Processor (ส่งเสียงผ่าน WebRTC ทันทีที่หลับตา) ----------
+class SirenAudioProcessor(AudioProcessorBase):
+    def __init__(self):
+        self.sample_idx = 0
+
+    def recv(self, frame: av.AudioFrame) -> av.AudioFrame:
+        global is_drowsy_global
+        pts = frame.pts
+        sample_rate = frame.sample_rate
+        num_samples = frame.samples
+        
+        # สร้าง Array สัญญาณเสียง PCM
+        if is_drowsy_global:
+            t = (np.arange(num_samples) + self.sample_idx) / sample_rate
+            self.sample_idx += num_samples
+            
+            # คลื่นเสียงความถี่ไซเรน 800Hz สลับ 400Hz
+            freq = 800.0 if (int(t[0] * 4) % 2 == 0) else 400.0
+            sine_wave = (0.3 * np.sin(2 * np.pi * freq * t) * 32767).astype(np.int16)
+            
+            # ปรับเป็น 2 Channels (Stereo)
+            audio_data = np.column_stack((sine_wave, sine_wave)).T
+        else:
+            self.sample_idx = 0
+            audio_data = np.zeros((2, num_samples), dtype=np.int16)
+
+        new_frame = av.AudioFrame.from_ndarray(audio_data, format="s16", layout="stereo")
+        new_frame.sample_rate = sample_rate
+        new_frame.pts = pts
+        return new_frame
+
+# ---------- 5. WebRTC ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
 })
@@ -127,111 +166,10 @@ webrtc_streamer(
     key="drowsiness-realtime",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=DrowsinessProcessor,
+    audio_processor_factory=SirenAudioProcessor,
     rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": False},
+    media_stream_constraints={"video": True, "audio": True},
     async_processing=True,
 )
 
-# ---------- 5. JavaScript ระบบเสียงไซเรนแบบเปิดสวิตช์ด้วยปุ่ม ----------
-js_siren_engine = """
-<div style="text-align: center; margin-top: 10px;">
-    <button id="enable-audio-btn" style="
-        background-color: #ff4b4b;
-        color: white;
-        border: none;
-        padding: 12px 24px;
-        font-size: 18px;
-        font-weight: bold;
-        border-radius: 8px;
-        cursor: pointer;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-    ">🔊 กดตรงนี้ 1 ครั้ง เพื่อเปิดระบบเสียงไซเรนเตือน</button>
-    <p id="audio-status" style="color: gray; font-size: 14px; margin-top: 8px;">สถานะระบบเสียง: รอการเปิดใช้งาน</p>
-</div>
-
-<script>
-let audioCtx = null;
-let isAudioEnabled = false;
-let lastPlayTime = 0;
-
-const btn = document.getElementById('enable-audio-btn');
-const statusText = document.getElementById('audio-status');
-
-btn.addEventListener('click', () => {
-    if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
-    isAudioEnabled = true;
-    btn.style.backgroundColor = '#28a745';
-    btn.innerText = '✅ ระบบเสียงไซเรนพร้อมทำงานแล้ว!';
-    statusText.innerText = 'สถานะระบบเสียง: กำลังเฝ้าระวังการหลับตา...';
-    
-    // ทดสอบยิงเสียงสั้นๆ เพื่อยืนยันว่าเสียงออกลำโพง
-    playBeep();
-});
-
-function playBeep() {
-    if (!audioCtx) return;
-    let osc = audioCtx.createOscillator();
-    let gain = audioCtx.createGain();
-    osc.type = 'sine';
-    osc.frequency.setValueAtTime(880, audioCtx.currentTime);
-    gain.gain.setValueAtTime(0.1, audioCtx.currentTime);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.15);
-}
-
-function triggerSiren() {
-    if (!audioCtx || !isAudioEnabled) return;
-    let now = Date.now();
-    if (now - lastPlayTime < 300) return; // ป้องกันเสียงยิงซ้ำถี่เกินไป
-    lastPlayTime = now;
-
-    let osc = audioCtx.createOscillator();
-    let gain = audioCtx.createGain();
-    
-    // เสียงไซเรนความถี่สลับสูง-ต่ำ
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(900, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(400, audioCtx.currentTime + 0.25);
-    
-    gain.gain.setValueAtTime(0.4, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.25);
-    
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.25);
-}
-
-// ตรวจจับภาพขอบสีแดงบนหน้าจอวิดีโอ real-time
-setInterval(() => {
-    if (!isAudioEnabled) return;
-    
-    let videos = parent.document.querySelectorAll("video");
-    if (videos.length === 0) return;
-    let video = videos[0];
-    if (video.paused || video.ended) return;
-
-    let canvas = document.createElement("canvas");
-    canvas.width = 40;
-    canvas.height = 40;
-    let ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, 40, 40);
-    
-    // เช็คจุดสีแดงบริเวณขอบบนซ้ายของวิดีโอ
-    let pixel = ctx.getImageData(3, 3, 1, 1).data;
-    if (pixel[0] > 180 && pixel[1] < 50 && pixel[2] < 50) {
-        triggerSiren();
-    }
-}, 80);
-</script>
-"""
-
-st.components.v1.html(js_siren_engine, height=120)
+st.warning("📌 ข้อแนะนำ: เมื่อเปิดกล้อง ให้แน่ใจว่าเบราว์เซอร์ไม่ได้ตั้งค่า Mute เสียงของแท็บเว็บนี้อยู่")
