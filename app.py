@@ -15,6 +15,7 @@ from streamlit_webrtc import (
 )
 from PIL import ImageFont, ImageDraw, Image
 import av
+import base64
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
@@ -78,6 +79,7 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.closed_counter = 0
         self.frame_idx = 0
+        self.drowsy_flag = False
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -109,20 +111,21 @@ class DrowsinessProcessor(VideoProcessorBase):
             if self.closed_counter >= CONSEC_FRAMES:
                 status_text = "!!! ง่วงนอน โปรดหยุดพัก !!!"
                 status_color = (0, 0, 255)
-                # วาดแถบสีแดงหนาไว้รอบๆ เพื่อให้ JS ฝั่งเบราว์เซอร์ใช้จับสัญญาณเสียง
-                cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 20)
+                cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 15)
+                self.drowsy_flag = True
             else:
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
+                self.drowsy_flag = False
+        else:
+            self.drowsy_flag = False
 
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ---------- 4. WebRTC ----------
 RTC_CONFIGURATION = RTCConfiguration({
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},
-    ]
+    "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
 })
 
 ctx = webrtc_streamer(
@@ -134,59 +137,25 @@ ctx = webrtc_streamer(
     async_processing=True,
 )
 
-# ---------- 5. JavaScript ดักจับขอบสีแดงแล้วเล่นเสียงไซเรนทันที ----------
-js_alarm = """
-<script>
-let audioCtx = null;
-let lastPlay = 0;
+# ---------- 5. HTML5 Audio Player (เล่นไฟล์เสียงตรงสไตล์ HTML) ----------
+# ลิงก์ไฟล์เสียงไซเรนออนไลน์แบบ Direct
+SOUND_URL = "https://www.soundjay.com/buttons/sounds/beep-07a.mp3"
 
-function playSound() {
-    if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    if (audioCtx.state === 'suspended') {
-        audioCtx.resume();
-    }
-    let now = Date.now();
-    if (now - lastPlay < 400) return; // เว้นระยะไม่ให้เสียงซ้อนกันจนแตก
-    lastPlay = now;
-
-    let osc = audioCtx.createOscillator();
-    let gain = audioCtx.createGain();
-    osc.type = 'sawtooth';
-    osc.frequency.setValueAtTime(900, audioCtx.currentTime);
-    osc.frequency.exponentialRampToValueAtTime(300, audioCtx.currentTime + 0.3);
-    
-    gain.gain.setValueAtTime(0.5, audioCtx.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
-    
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    
-    osc.start();
-    osc.stop(audioCtx.currentTime + 0.3);
-}
-
-// ตรวจสอบพิกเซลสีแดงของวิดีโอบนหน้าจอทุกๆ 100ms
-setInterval(() => {
-    let videos = parent.document.querySelectorAll("video");
-    if (videos.length === 0) return;
-    let video = videos[0];
-    if (video.paused || video.ended) return;
-
-    let canvas = document.createElement("canvas");
-    canvas.width = 50;
-    canvas.height = 50;
-    let ctx = canvas.getContext("2d");
-    ctx.drawImage(video, 0, 0, 50, 50);
-    
-    // สุ่มเช็คจุดสีขอบวิดีโอ (ถ้าวิดีโอขึ้นขอบสีแดงเตือนหลับใน)
-    let pixel = ctx.getImageData(5, 5, 1, 1).data;
-    if (pixel[0] > 180 && pixel[1] < 50 && pixel[2] < 50) {
-        playSound();
-    }
-}, 100);
-</script>
+audio_html = f"""
+    <audio id="alarm-sound" src="{SOUND_URL}" preload="auto"></audio>
+    <script>
+        var audio = document.getElementById('alarm-sound');
+        audio.play().catch(e => console.log('Autoplay blocked'));
+    </script>
 """
 
-st.components.v1.html(js_alarm, height=0)
+# เช็คสถานะหลับตาจาก Frame
+if ctx.video_processor:
+    if ctx.video_processor.drowsy_flag:
+        st.components.v1.html(audio_html, height=0)
+        st.error("🚨 ตรวจพบการหลับใน! (กำลังเล่นเสียงเตือน)")
+
+# ---------- 6. ปุ่มกดทดสอบเสียงเตือน ----------
+if st.button("🔊 ทดสอบกดเล่นเสียงไซเรน"):
+    st.components.v1.html(audio_html, height=0)
+    st.success("ส่งคำสั่งเล่นเสียงเตือนเรียบร้อย!")
