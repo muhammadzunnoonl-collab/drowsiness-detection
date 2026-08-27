@@ -2,8 +2,6 @@ import math
 import os
 import time
 import urllib.request
-import threading
-
 import cv2
 import numpy as np
 import streamlit as st
@@ -13,7 +11,6 @@ from mediapipe.tasks.python import vision
 from streamlit_webrtc import (
     webrtc_streamer,
     VideoProcessorBase,
-    AudioProcessorBase,
     RTCConfiguration,
     WebRtcMode,
 )
@@ -22,15 +19,19 @@ import av
 
 st.set_page_config(page_title="ตรวจจับการหลับใน (เรียลไทม์)", layout="centered")
 st.title("🚗 ระบบตรวจจับการหลับในขณะขับรถ (เรียลไทม์)")
-st.caption("เปิดกล้อง+ไมค์ แล้วระบบจะส่งเสียงไซเรนอัตโนมัติทันทีที่หลับตานานเกินกำหนด")
-st.info("⚠️ เบราว์เซอร์จะขอสิทธิ์กล้องและไมโครโฟน กรุณากด Allow ทั้งสองอย่าง (ระบบไม่บันทึกเสียงจากไมค์ไปที่ไหน ใช้แค่ส่งเสียงไซเรนกลับเท่านั้น)")
+st.caption("เปิดกล้องแล้วระบบจะส่งเสียงไซเรนเตือนทันทีที่ตรวจพบการหลับใน")
 
 # ---------- 0. ฟอนต์ไทย ----------
-FONT_PATH = "THSarabunNew.ttf"   # แก้ให้ตรงกับชื่อไฟล์ .ttf ที่อัปโหลดจริง
-thai_font = ImageFont.truetype(FONT_PATH, 32)
+FONT_PATH = "THSarabunNew.ttf"
+
+def get_font():
+    if os.path.exists(FONT_PATH):
+        return ImageFont.truetype(FONT_PATH, 32)
+    return ImageFont.load_default()
+
+thai_font = get_font()
 
 def put_thai_text(img_bgr, text, position, color=(255, 255, 255)):
-    """วาดข้อความภาษาไทยลงบนภาพ OpenCV (BGR) โดยใช้ PIL"""
     img_pil = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(img_pil)
     draw.text(position, text, font=thai_font, fill=(color[2], color[1], color[0]))
@@ -64,9 +65,7 @@ def calculate_ear(landmarks, eye_indices):
     h = euclidean_dist(p1, p4)
     return (v1 + v2) / (2.0 * h) if h != 0 else 0.0
 
-# ---------- 3. สถานะแจ้งเตือนที่ใช้ร่วมกันระหว่างวิดีโอ/เสียง ----------
-drowsy_event = threading.Event()   # set() = กำลังง่วง, clear() = ปกติ
-
+# ---------- 3. Video Processor ----------
 class DrowsinessProcessor(VideoProcessorBase):
     def __init__(self):
         base_options = mp_python.BaseOptions(model_asset_path=model_path)
@@ -80,6 +79,7 @@ class DrowsinessProcessor(VideoProcessorBase):
         self.detector = vision.FaceLandmarker.create_from_options(options)
         self.closed_counter = 0
         self.frame_idx = 0
+        self.is_drowsy = False
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -112,52 +112,18 @@ class DrowsinessProcessor(VideoProcessorBase):
                 status_text = "!!! ง่วงนอน โปรดหยุดพัก !!!"
                 status_color = (0, 0, 255)
                 cv2.rectangle(img, (0, 0), (w - 1, h - 1), (0, 0, 255), 8)
-                drowsy_event.set()      # <-- สั่งให้แทร็กเสียงเริ่มดัง
+                self.is_drowsy = True
             else:
                 status_text = "ปกติ"
                 status_color = (0, 255, 0)
-                drowsy_event.clear()    # <-- สั่งให้เงียบ
+                self.is_drowsy = False
         else:
-            drowsy_event.clear()
+            self.is_drowsy = False
 
         img = put_thai_text(img, status_text, (20, h - 60), status_color)
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-
-# ---------- 4. ตัวสร้างเสียงไซเรน ส่งผ่านแทร็กเสียงของ WebRTC โดยตรง ----------
-class AlarmAudioProcessor(AudioProcessorBase):
-    def __init__(self):
-        self.phase_samples = 0
-
-    def _make_tone_frame(self, frame: av.AudioFrame) -> av.AudioFrame:
-        sr = frame.sample_rate
-        n = frame.samples  # จำนวนตัวอย่างเสียงต่อช่อง (per-channel)
-        samples = frame.to_ndarray()
-
-        if drowsy_event.is_set():
-            t = (np.arange(n) + self.phase_samples) / sr
-            tone_mono = (0.5 * np.sin(2 * np.pi * 1000.0 * t) * 32767).astype(np.int16)
-            self.phase_samples += n
-            repeats = samples.size // n if n else 1
-            out = np.tile(tone_mono, repeats).reshape(samples.shape).astype(samples.dtype)
-        else:
-            self.phase_samples = 0
-            out = np.zeros(samples.shape, dtype=samples.dtype)
-
-        new_frame = av.AudioFrame.from_ndarray(
-            out,
-            format=frame.format.name,   # ระบุ format ให้ตรงกับต้นฉบับ
-            layout=frame.layout.name,
-        )
-        new_frame.sample_rate = sr
-        new_frame.pts = frame.pts
-        return new_frame
-
-    async def recv_queued(self, frames):
-        return [self._make_tone_frame(f) for f in frames]
-
-
-# ---------- 5. TURN server ----------
+# ---------- 4. TURN Server & WebRTC ----------
 RTC_CONFIGURATION = RTCConfiguration({
     "iceServers": [
         {"urls": ["stun:stun.l.google.com:19302"]},
@@ -171,11 +137,6 @@ RTC_CONFIGURATION = RTCConfiguration({
             "username": st.secrets.get("TURN_USERNAME", ""),
             "credential": st.secrets.get("TURN_CREDENTIAL", ""),
         },
-        {
-            "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
-            "username": st.secrets.get("TURN_USERNAME", ""),
-            "credential": st.secrets.get("TURN_CREDENTIAL", ""),
-        },
     ]
 })
 
@@ -183,20 +144,49 @@ ctx = webrtc_streamer(
     key="drowsiness-realtime",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=DrowsinessProcessor,
-    audio_processor_factory=AlarmAudioProcessor,
     rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"video": True, "audio": True},
-    video_html_attrs={"autoPlay": True, "controls": True, "muted": False},
-    audio_html_attrs={"autoPlay": True, "controls": True, "muted": False},
+    media_stream_constraints={"video": True, "audio": False}, # ไม่ต้องขอสิทธิ์ไมค์ให้ยุ่งยาก
     async_processing=True,
 )
 
-if ctx.state.playing:
-    st.success("✅ ระบบกำลังทำงาน — เสียงไซเรนจะดังอัตโนมัติทันทีที่ตรวจพบหลับตา ไม่ต้องกดอะไรเพิ่ม")
+# ---------- 5. ระบบส่งเสียงเตือนผ่าน HTML5 Web Audio API ----------
+# สคริปต์ส่งเสียงไซเรนความถี่สูงเตือนผู้ใช้ผ่านเบราว์เซอร์
+sound_script = """
+<script>
+if (!window.audioCtx) {
+    window.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playSiren() {
+    if (window.audioCtx.state === 'suspended') {
+        window.audioCtx.resume();
+    }
+    var osc = window.audioCtx.createOscillator();
+    var gain = window.audioCtx.createGain();
+    
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(800, window.audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(400, window.audioCtx.currentTime + 0.3);
+    
+    gain.gain.setValueAtTime(0.3, window.audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.01, window.audioCtx.currentTime + 0.3);
+    
+    osc.connect(gain);
+    gain.connect(window.audioCtx.destination);
+    
+    osc.start();
+    osc.stop(window.audioCtx.currentTime + 0.3);
+}
+playSiren();
+</script>
+"""
 
-# ---------- 6. ปุ่มทดสอบบังคับเสียงไซเรน (ไม่ต้องหลับตา) ----------
-if st.button("🧪 ทดสอบบังคับเสียงไซเรน 3 วินาที (ไม่ต้องหลับตา)"):
-    drowsy_event.set()
-    time.sleep(3)
-    drowsy_event.clear()
-    st.success("ปล่อยสัญญาณเสียงไปแล้ว ถ้าไม่ได้ยิน แปลว่าปัญหาอยู่ที่ท่อเสียง WebRTC")
+# วนลูปเช็คสถานะการง่วงจาก VideoProcessor เพื่อยิงเสียงผ่านหน้าเว็บ
+if ctx.video_processor:
+    if ctx.video_processor.is_drowsy:
+        st.components.v1.html(sound_script, height=0)
+        st.error("🚨 ตรวจพบอาการหลับใน! กำลังส่งเสียงเตือน...")
+
+# ---------- 6. ปุ่มทดสอบเสียงไซเรน ----------
+if st.button("🧪 ทดสอบบังคับเสียงไซเรน 1 ครั้ง"):
+    st.components.v1.html(sound_script, height=0)
+    st.success("ส่งสัญญาณเสียงไซเรนเรียบร้อย!")
